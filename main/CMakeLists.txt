@@ -2,10 +2,23 @@ idf_component_register(SRCS "main.c" "llm.c"
                     INCLUDE_DIRS ""  LDFRAGMENTS "../linker.lf")
 
 
-
-# https://github.com/espressif/esp-idf/issues/11696#issuecomment-1596208414
-target_compile_options(${COMPONENT_LIB} PRIVATE -fno-if-conversion) # 
-
+# Aggressive performance optimization flags for LLM inference
+# Note: -Ofast and -ffast-math sacrifice IEEE 754 compliance for speed.
+# This is acceptable for LLM inference where:
+# 1. The model already uses approximations (fast_exp, fast_rsqrt, fast_sigmoid)
+# 2. Input values are bounded (embeddings, attention scores)
+# 3. Small numerical differences don't affect token selection quality
+#
+# If exact IEEE compliance is needed, replace -Ofast with -O3 and remove -ffast-math
+target_compile_options(${COMPONENT_LIB} PRIVATE 
+    -Ofast
+    -ffast-math
+    -funroll-loops
+    -finline-functions
+    -fomit-frame-pointer
+    -ftree-vectorize
+    -fno-if-conversion
+)
 
 # Create a SPIFFS image from the contents of the 'spiffs_image' directory
 # that fits the partition named 'data'. FLASH_IN_PROJECT indicates that

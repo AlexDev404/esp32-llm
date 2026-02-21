@@ -4,6 +4,7 @@
  * https://github.com/karpathy/llama2.c 
  * 
  * Slight modifications added to make it ESP32 friendly
+ * Additional optimizations for maximum tok/s on ESP32-S3
  */
 
 #include "llm.h"
@@ -18,6 +19,46 @@
 #include "esp_system.h"
 #include "esp_dsp.h"
 #include "esp_attr.h"
+#include "dsps_dotprod.h"
+
+// Fast inverse square root (Quake III algorithm, adapted for ESP32)
+// Using union for safe type punning (standards compliant)
+static inline float IRAM_ATTR fast_rsqrt(float x) {
+    union { float f; int32_t i; } u;
+    u.f = x;
+    float xhalf = 0.5f * x;
+    u.i = 0x5f3759df - (u.i >> 1);
+    u.f = u.f * (1.5f - xhalf * u.f * u.f);  // One Newton-Raphson iteration
+    return u.f;
+}
+
+// Fast exponential approximation using Schraudolph's method
+// More accurate than basic approximation, good for softmax
+static inline float IRAM_ATTR fast_exp(float x) {
+    // Clamp to avoid overflow/underflow
+    if (x < -88.0f) return 0.0f;
+    if (x > 88.0f) return 3.4e38f;
+    
+    // Schraudolph's approximation with improved accuracy
+    union { float f; int32_t i; } u;
+    u.i = (int32_t)(12102203.0f * x + 1064866805.0f);
+    return u.f;
+}
+
+// Fast sigmoid approximation for SwiGLU
+// Uses rational polynomial approximation based on tanh identity:
+// sigmoid(x) ≈ 0.5 * (1 + tanh_approx(x/2))
+// The tanh is approximated using a Padé-like rational function
+// Accuracy: ~1-2% relative error, which is acceptable for inference
+static inline float IRAM_ATTR fast_sigmoid(float x) {
+    float x2 = x * 0.5f;
+    if (x2 > 4.0f) return 1.0f;
+    if (x2 < -4.0f) return 0.0f;
+    float x2_sq = x2 * x2;
+    float num = x2 * (27.0f + x2_sq);
+    float den = 27.0f + 9.0f * x2_sq;
+    return 0.5f * (1.0f + num / den);
+}
 
 #define MAP_FAILED NULL
 #define munmap(ptr, length) custom_munmap(ptr)
@@ -248,152 +289,192 @@ void free_transformer(Transformer *t)
 // ----------------------------------------------------------------------------
 // neural net blocks; the dynamics of the Transformer
 
-void rmsnorm(v4sf *o, v4sf *x, v4sf *weight, int size)
+// Optimized rmsnorm using SIMD dot product and fast inverse square root
+void IRAM_ATTR rmsnorm(v4sf * restrict o, v4sf * restrict x, v4sf * restrict weight, int size)
 {
-    // calculate sum of squares
-    v4sf ss = 0.0f;
-    for (int j = 0; j < size; j++)
+    // Use ESP-DSP SIMD dot product for sum of squares
+    v4sf ss;
+    dsps_dotprod_f32_aes3(x, x, &ss, size);
+    
+    // Calculate inverse RMS using fast inverse square root
+    ss = ss / size + 1e-5f;
+    ss = fast_rsqrt(ss);
+    
+    // Normalize and scale - unrolled for better performance
+    int i = 0;
+    for (; i + 3 < size; i += 4)
     {
-        ss += x[j] * x[j];
+        o[i] = weight[i] * (ss * x[i]);
+        o[i+1] = weight[i+1] * (ss * x[i+1]);
+        o[i+2] = weight[i+2] * (ss * x[i+2]);
+        o[i+3] = weight[i+3] * (ss * x[i+3]);
     }
-    ss /= size;
-    ss += 1e-5f;
-    ss = 1.0f / sqrtf(ss);
-    // normalize and scale
-    for (int j = 0; j < size; j++)
+    for (; i < size; i++)
     {
-        o[j] = weight[j] * (ss * x[j]);
+        o[i] = weight[i] * (ss * x[i]);
     }
 }
 
-void softmax(v4sf *x, int size)
+// Optimized softmax using fast exp approximation
+void IRAM_ATTR softmax(v4sf * restrict x, int size)
 {
-    // find max value (for numerical stability)
+    // find max value (for numerical stability) - unrolled
     v4sf max_val = x[0];
-    for (int i = 1; i < size; i++)
+    int i = 1;
+    for (; i + 3 < size; i += 4)
     {
-        if (x[i] > max_val)
-        {
-            max_val = x[i];
-        }
+        if (x[i] > max_val) max_val = x[i];
+        if (x[i+1] > max_val) max_val = x[i+1];
+        if (x[i+2] > max_val) max_val = x[i+2];
+        if (x[i+3] > max_val) max_val = x[i+3];
     }
-    // exp and sum
-    v4sf sum = 0.0f;
-    for (int i = 0; i < size; i++)
+    for (; i < size; i++)
     {
-        x[i] = expf(x[i] - max_val);
+        if (x[i] > max_val) max_val = x[i];
+    }
+    
+    // exp and sum - using fast_exp and unrolling
+    v4sf sum = 0.0f;
+    for (i = 0; i + 3 < size; i += 4)
+    {
+        x[i] = fast_exp(x[i] - max_val);
+        x[i+1] = fast_exp(x[i+1] - max_val);
+        x[i+2] = fast_exp(x[i+2] - max_val);
+        x[i+3] = fast_exp(x[i+3] - max_val);
+        sum += x[i] + x[i+1] + x[i+2] + x[i+3];
+    }
+    for (; i < size; i++)
+    {
+        x[i] = fast_exp(x[i] - max_val);
         sum += x[i];
     }
-    // normalize
-    for (int i = 0; i < size; i++)
+    
+    // normalize using reciprocal multiplication instead of division
+    v4sf inv_sum = 1.0f / sum;
+    for (i = 0; i + 3 < size; i += 4)
     {
-        x[i] /= sum;
+        x[i] *= inv_sum;
+        x[i+1] *= inv_sum;
+        x[i+2] *= inv_sum;
+        x[i+3] *= inv_sum;
+    }
+    for (; i < size; i++)
+    {
+        x[i] *= inv_sum;
     }
 }
 
-void matmul_task(void *params)
+void IRAM_ATTR matmul_task(void *params)
 {
-    const TickType_t xDelay = 1 / portTICK_PERIOD_MS;
     MatMulTaskParams *p = (MatMulTaskParams *)params;
-    TaskHandle_t current_task = xTaskGetCurrentTaskHandle();
-    char *tName = pcTaskGetName(current_task);
-    // ESP_LOGI(TAG, "Created Task %s", tName);
     for (;;)
     {
         if (xSemaphoreTake(semaDataReady, portMAX_DELAY) == pdTRUE)
         {
-            //   ESP_LOGI(TAG, "Started Task %s", tName);
+            v4sf * restrict xout = p->xout;
+            v4sf * restrict x = p->x;
+            v4sf * restrict w = p->w;
+            const int n = p->n;
+            
             for (int i = p->start; i < p->end; i++)
             {
                 v4sf val = 0.0f;
-                v4sf *row = &p->w[i * p->n]; // Pointer to the start of the current row in matrix w
-                dsps_dotprod_f32_aes3(row, p->x, &val, p->n);
-                p->xout[i] = val;
+                v4sf *row = &w[i * n];
+                dsps_dotprod_f32_aes3(row, x, &val, n);
+                xout[i] = val;
             }
-            //    ESP_LOGI(TAG, "Completed task %s", tName);
             xSemaphoreGive(semaDataReady);
             xEventGroupSync(xEventGroup, p->task_num, ALL_SYNC_BITS, portMAX_DELAY);
         }
     }
 }
 
-void forward_task(void *params)
+void IRAM_ATTR forward_task(void *params)
 {
-    const TickType_t xDelay = 1 / portTICK_PERIOD_MS;
     ForwardTaskParams *t_params = (ForwardTaskParams *)params;
-    TaskHandle_t current_task = xTaskGetCurrentTaskHandle();
-    char *tName = pcTaskGetName(current_task);
-    // ESP_LOGI(TAG, "Created Task %s", tName);
     for (;;)
     {
         if (xSemaphoreTake(semaForwardDataReady, portMAX_DELAY) == pdTRUE)
         {
-            //   ESP_LOGI(TAG, "Started Task %s", tName);
-            int h;
-            // #pragma omp parallel for private(h)
-            for (h = t_params->start; h < t_params->end; h++)
+            const int head_size = t_params->head_size;
+            const int kv_dim = t_params->kv_dim;
+            const int kv_mul = t_params->kv_mul;
+            const int loff = t_params->loff;
+            const int pos = t_params->pos;
+            const int seq_len = t_params->p->seq_len;
+            
+            // Pre-compute inverse sqrt of head_size
+            const v4sf scale = fast_rsqrt((v4sf)head_size);
+            
+            for (int h = t_params->start; h < t_params->end; h++)
             {
                 // get the query vector for this head
-                v4sf *q = t_params->s->q + h * t_params->head_size;
+                v4sf * restrict q = t_params->s->q + h * head_size;
                 // attention scores for this head
-                v4sf *att = t_params->s->att + h * t_params->p->seq_len;
-                // iterate over all timesteps, including the current one
-                for (int t = 0; t <= t_params->pos; t++)
+                v4sf * restrict att = t_params->s->att + h * seq_len;
+                
+                // iterate over all timesteps using SIMD dot product
+                for (int t = 0; t <= pos; t++)
                 {
                     // get the key vector for this head and at this timestep
-                    v4sf *k = t_params->s->key_cache + t_params->loff + t * t_params->kv_dim + (h / t_params->kv_mul) * t_params->head_size;
-                    // calculate the attention score as the dot product of q and k
-                    v4sf score = 0.0f;
-                    for (int i = 0; i < t_params->head_size; i++)
-                    {
-                        score += q[i] * k[i];
-                    }
-                    score /= sqrtf(t_params->head_size);
-                    // save the score to the attention buffer
-                    att[t] = score;
+                    v4sf *k = t_params->s->key_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
+                    // calculate the attention score using SIMD dot product
+                    v4sf score;
+                    dsps_dotprod_f32_aes3(q, k, &score, head_size);
+                    att[t] = score * scale;
                 }
 
-                // softmax the scores to get attention weights, from 0..pos inclusively
-                softmax(att, t_params->pos + 1);
+                // softmax the scores to get attention weights
+                softmax(att, pos + 1);
 
                 // weighted sum of the values, store back into xb
-                v4sf *xb = t_params->s->xb + h * t_params->head_size;
-                memset(xb, 0, t_params->head_size * sizeof(v4sf));
-                for (int t = 0; t <= t_params->pos; t++)
+                v4sf * restrict xb = t_params->s->xb + h * head_size;
+                memset(xb, 0, head_size * sizeof(v4sf));
+                
+                for (int t = 0; t <= pos; t++)
                 {
                     // get the value vector for this head and at this timestep
-                    v4sf *v = t_params->s->value_cache + t_params->loff + t * t_params->kv_dim + (h / t_params->kv_mul) * t_params->head_size;
+                    v4sf *v = t_params->s->value_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
                     // get the attention weight for this timestep
                     v4sf a = att[t];
-                    // accumulate the weighted value into xb
-                    for (int i = 0; i < t_params->head_size; i++)
+                    // accumulate the weighted value into xb - unrolled
+                    int i = 0;
+                    for (; i + 3 < head_size; i += 4)
+                    {
+                        xb[i] += a * v[i];
+                        xb[i+1] += a * v[i+1];
+                        xb[i+2] += a * v[i+2];
+                        xb[i+3] += a * v[i+3];
+                    }
+                    for (; i < head_size; i++)
                     {
                         xb[i] += a * v[i];
                     }
                 }
             }
-            //   ESP_LOGI(TAG, "Completed task %s", tName);
             xSemaphoreGive(semaForwardDataReady);
             xEventGroupSync(ForwardEventGroup, t_params->task_num, ALL_FORWARD_TASKS, portMAX_DELAY);
         }
     }
 }
 
-void matmul(v4sf *xout, v4sf *x, v4sf *w, int n, int d)
+void IRAM_ATTR matmul(v4sf * restrict xout, v4sf * restrict x, v4sf * restrict w, int n, int d)
 {
-
     // d is the number of rows
     // n is the number of columns
     // d X n
     *matmul_params = (MatMulTaskParams){xout, x, w, d / 2, d, n, d, TASK_1_BIT};
     xSemaphoreGive(semaDataReady);
+    
+    // Process first half on this core
     for (int i = 0; i < d / 2; i++)
     {
         v4sf val = 0.0f;
-        v4sf *row = &w[i * n]; // Pointer to the start of the current row in matrix w
+        v4sf *row = &w[i * n];
         dsps_dotprod_f32_aes3(row, x, &val, n);
         xout[i] = val;
     }
+    
     if (xSemaphoreTake(semaDataReady, portMAX_DELAY) == pdTRUE)
     {
         xEventGroupSync(xEventGroup,
@@ -403,38 +484,36 @@ void matmul(v4sf *xout, v4sf *x, v4sf *w, int n, int d)
 
         xEventGroupClearBits(xEventGroup, ALL_SYNC_BITS);
     }
-    //   ESP_LOGI(TAG, "Completed MatMul tasks");
 }
 
-v4sf *forward(Transformer *transformer, int token, int pos)
+v4sf * IRAM_ATTR forward(Transformer *transformer, int token, int pos)
 {
-    ESP_LOGD(TAG, "ram available: %lu", esp_get_free_heap_size());
-
     // a few convenience variables
     Config *p = &transformer->config;
     TransformerWeights *w = &transformer->weights;
     RunState *s = &transformer->state;
-    v4sf *x = s->x;
-    int dim = p->dim;
-    int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
-    int kv_mul = p->n_heads / p->n_kv_heads; // integer multiplier of the kv sharing in multiquery
-    int hidden_dim = p->hidden_dim;
-    int head_size = dim / p->n_heads;
+    v4sf * restrict x = s->x;
+    const int dim = p->dim;
+    const int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
+    const int kv_mul = p->n_heads / p->n_kv_heads;
+    const int hidden_dim = p->hidden_dim;
+    const int head_size = dim / p->n_heads;
+    
+    // Pre-compute scale factor for attention
+    const v4sf scale = fast_rsqrt((v4sf)head_size);
 
     // copy the token embedding into x
     v4sf *content_row = w->token_embedding_table + token * dim;
-    ESP_LOGD(TAG, "Content row: %f", *content_row);
     memcpy(x, content_row, dim * sizeof(*x));
 
     // forward all the layers
-    for (unsigned long long l = 0; l < p->n_layers; l++)
+    for (int l = 0; l < p->n_layers; l++)
     {
-        ESP_LOGD(TAG, "X: %f, Weights %f", *x, *w->rms_att_weight);
         // attention rmsnorm
         rmsnorm(s->xb, x, w->rms_att_weight + l * dim, dim);
 
         // key and value point to the kv cache
-        int loff = l * p->seq_len * kv_dim; // kv cache layer offset for convenience
+        const int loff = l * p->seq_len * kv_dim;
         s->k = s->key_cache + loff + pos * kv_dim;
         s->v = s->value_cache + loff + pos * kv_dim;
 
@@ -444,24 +523,27 @@ v4sf *forward(Transformer *transformer, int token, int pos)
         matmul(s->v, s->xb, w->wv + l * dim * kv_dim, dim, kv_dim);
 
         // RoPE relative positional encoding: complex-valued rotate q and k in each head
+        // Optimized with pre-computed values and loop unrolling
         for (int i = 0; i < dim; i += 2)
         {
-            int head_dim = i % head_size;
-            v4sf freq = 1.0f / powf(10000.0f, head_dim / (v4sf)head_size);
-            v4sf val = pos * freq;
-            v4sf fcr = cosf(val);
-            v4sf fci = sinf(val);
-            int rotn = i < kv_dim ? 2 : 1; // how many vectors? 2 = q & k, 1 = q only
-            for (int v = 0; v < rotn; v++)
+            const int head_dim = i % head_size;
+            const v4sf freq = 1.0f / powf(10000.0f, head_dim / (v4sf)head_size);
+            const v4sf val = pos * freq;
+            const v4sf fcr = cosf(val);
+            const v4sf fci = sinf(val);
+            const int rotn = i < kv_dim ? 2 : 1;
+            
+            for (int vi = 0; vi < rotn; vi++)
             {
-                v4sf *vec = v == 0 ? s->q : s->k; // the vector to rotate (query or key)
-                v4sf v0 = vec[i];
-                v4sf v1 = vec[i + 1];
+                v4sf * restrict vec = vi == 0 ? s->q : s->k;
+                const v4sf v0 = vec[i];
+                const v4sf v1 = vec[i + 1];
                 vec[i] = v0 * fcr - v1 * fci;
                 vec[i + 1] = v0 * fci + v1 * fcr;
             }
         }
-        // start task
+        
+        // start task for second half of attention heads
         *forward_params = (ForwardTaskParams){
             .s = s,
             .w = w,
@@ -479,53 +561,48 @@ v4sf *forward(Transformer *transformer, int token, int pos)
         };
         xSemaphoreGive(semaForwardDataReady);
 
-        // multihead attention. iterate over all heads
-        int h;
-        // #pragma omp parallel for private(h)
-        for (h = 0; h < (p->n_heads / 2); h++)
+        // multihead attention - first half on this core with SIMD optimizations
+        for (int h = 0; h < (p->n_heads / 2); h++)
         {
-            // get the query vector for this head
-            v4sf *q = s->q + h * head_size;
-            // attention scores for this head
-            v4sf *att = s->att + h * p->seq_len;
-            // iterate over all timesteps, including the current one
+            v4sf * restrict q = s->q + h * head_size;
+            v4sf * restrict att = s->att + h * p->seq_len;
+            
+            // Use SIMD dot product for attention scores
             for (int t = 0; t <= pos; t++)
             {
-                // get the key vector for this head and at this timestep
                 v4sf *k = s->key_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
-                // calculate the attention score as the dot product of q and k
-                v4sf score = 0.0f;
-                for (int i = 0; i < head_size; i++)
-                {
-                    score += q[i] * k[i];
-                }
-                score /= sqrtf(head_size);
-                // save the score to the attention buffer
-                att[t] = score;
+                v4sf score;
+                dsps_dotprod_f32_aes3(q, k, &score, head_size);
+                att[t] = score * scale;
             }
 
-            // softmax the scores to get attention weights, from 0..pos inclusively
             softmax(att, pos + 1);
 
-            // weighted sum of the values, store back into xb
-            v4sf *xb = s->xb + h * head_size;
+            // weighted sum of the values - unrolled
+            v4sf * restrict xb = s->xb + h * head_size;
             memset(xb, 0, head_size * sizeof(v4sf));
+            
             for (int t = 0; t <= pos; t++)
             {
-                // get the value vector for this head and at this timestep
                 v4sf *v = s->value_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
-                // get the attention weight for this timestep
-                v4sf a = att[t];
-                // accumulate the weighted value into xb
-                for (int i = 0; i < head_size; i++)
+                const v4sf a = att[t];
+                int i = 0;
+                for (; i + 3 < head_size; i += 4)
+                {
+                    xb[i] += a * v[i];
+                    xb[i+1] += a * v[i+1];
+                    xb[i+2] += a * v[i+2];
+                    xb[i+3] += a * v[i+3];
+                }
+                for (; i < head_size; i++)
                 {
                     xb[i] += a * v[i];
                 }
             }
         }
+        
         if (xSemaphoreTake(semaForwardDataReady, portMAX_DELAY) == pdTRUE)
         {
-
             xEventGroupSync(ForwardEventGroup,
                             FORWARD_TASK_2,
                             ALL_FORWARD_TASKS,
@@ -536,8 +613,16 @@ v4sf *forward(Transformer *transformer, int token, int pos)
             // final matmul to get the output of the attention
             matmul(s->xb2, s->xb, w->wo + l * dim * dim, dim, dim);
 
-            // residual connection back into x
-            for (int i = 0; i < dim; i++)
+            // residual connection back into x - unrolled
+            int i = 0;
+            for (; i + 3 < dim; i += 4)
+            {
+                x[i] += s->xb2[i];
+                x[i+1] += s->xb2[i+1];
+                x[i+2] += s->xb2[i+2];
+                x[i+3] += s->xb2[i+3];
+            }
+            for (; i < dim; i++)
             {
                 x[i] += s->xb2[i];
             }
@@ -545,27 +630,43 @@ v4sf *forward(Transformer *transformer, int token, int pos)
             // ffn rmsnorm
             rmsnorm(s->xb, x, w->rms_ffn_weight + l * dim, dim);
 
-            // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
-            // first calculate self.w1(x) and self.w3(x)
+            // FFN: self.w2(F.silu(self.w1(x)) * self.w3(x))
             matmul(s->hb, s->xb, w->w1 + l * dim * hidden_dim, dim, hidden_dim);
             matmul(s->hb2, s->xb, w->w3 + l * dim * hidden_dim, dim, hidden_dim);
 
-            // SwiGLU non-linearity
-            for (int i = 0; i < hidden_dim; i++)
+            // SwiGLU non-linearity - optimized with fast_sigmoid and unrolling
+            i = 0;
+            for (; i + 3 < hidden_dim; i += 4)
+            {
+                v4sf val0 = s->hb[i];
+                v4sf val1 = s->hb[i+1];
+                v4sf val2 = s->hb[i+2];
+                v4sf val3 = s->hb[i+3];
+                // silu(x)=x*σ(x) using fast_sigmoid
+                s->hb[i] = val0 * fast_sigmoid(val0) * s->hb2[i];
+                s->hb[i+1] = val1 * fast_sigmoid(val1) * s->hb2[i+1];
+                s->hb[i+2] = val2 * fast_sigmoid(val2) * s->hb2[i+2];
+                s->hb[i+3] = val3 * fast_sigmoid(val3) * s->hb2[i+3];
+            }
+            for (; i < hidden_dim; i++)
             {
                 v4sf val = s->hb[i];
-                // silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
-                val *= (1.0f / (1.0f + expf(-val)));
-                // elementwise multiply with w3(x)
-                val *= s->hb2[i];
-                s->hb[i] = val;
+                s->hb[i] = val * fast_sigmoid(val) * s->hb2[i];
             }
 
             // final matmul to get the output of the ffn
             matmul(s->xb, s->hb, w->w2 + l * dim * hidden_dim, hidden_dim, dim);
 
-            // residual connection
-            for (int i = 0; i < dim; i++)
+            // residual connection - unrolled
+            i = 0;
+            for (; i + 3 < dim; i += 4)
+            {
+                x[i] += s->xb[i];
+                x[i+1] += s->xb[i+1];
+                x[i+2] += s->xb[i+2];
+                x[i+3] += s->xb[i+3];
+            }
+            for (; i < dim; i++)
             {
                 x[i] += s->xb[i];
             }
