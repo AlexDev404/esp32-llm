@@ -3,12 +3,13 @@ idf_component_register(SRCS "main.c" "llm.c"
 
 
 # Aggressive performance optimization flags for LLM inference
-# -Ofast: Enable all -O3 optimizations plus fast-math
-# -ffast-math: Allow aggressive floating-point optimizations
-# -funroll-loops: Unroll loops for better performance
-# -finline-functions: Inline functions aggressively
-# -fomit-frame-pointer: Free up a register for general use
-# -ftree-vectorize: Enable auto-vectorization
+# Note: -Ofast and -ffast-math sacrifice IEEE 754 compliance for speed.
+# This is acceptable for LLM inference where:
+# 1. The model already uses approximations (fast_exp, fast_rsqrt, fast_sigmoid)
+# 2. Input values are bounded (embeddings, attention scores)
+# 3. Small numerical differences don't affect token selection quality
+#
+# If exact IEEE compliance is needed, replace -Ofast with -O3 and remove -ffast-math
 target_compile_options(${COMPONENT_LIB} PRIVATE 
     -Ofast
     -ffast-math

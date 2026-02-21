@@ -22,13 +22,14 @@
 #include "dsps_dotprod.h"
 
 // Fast inverse square root (Quake III algorithm, adapted for ESP32)
+// Using union for safe type punning (standards compliant)
 static inline float IRAM_ATTR fast_rsqrt(float x) {
+    union { float f; int32_t i; } u;
+    u.f = x;
     float xhalf = 0.5f * x;
-    int i = *(int*)&x;
-    i = 0x5f3759df - (i >> 1);
-    x = *(float*)&i;
-    x = x * (1.5f - xhalf * x * x);  // One Newton-Raphson iteration
-    return x;
+    u.i = 0x5f3759df - (u.i >> 1);
+    u.f = u.f * (1.5f - xhalf * u.f * u.f);  // One Newton-Raphson iteration
+    return u.f;
 }
 
 // Fast exponential approximation using Schraudolph's method
@@ -45,9 +46,11 @@ static inline float IRAM_ATTR fast_exp(float x) {
 }
 
 // Fast sigmoid approximation for SwiGLU
+// Uses rational polynomial approximation based on tanh identity:
+// sigmoid(x) ≈ 0.5 * (1 + tanh_approx(x/2))
+// The tanh is approximated using a Padé-like rational function
+// Accuracy: ~1-2% relative error, which is acceptable for inference
 static inline float IRAM_ATTR fast_sigmoid(float x) {
-    // Fast sigmoid using tanh approximation: sigmoid(x) = 0.5 * (1 + tanh(x/2))
-    // Using rational approximation for tanh
     float x2 = x * 0.5f;
     if (x2 > 4.0f) return 1.0f;
     if (x2 < -4.0f) return 0.0f;

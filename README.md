@@ -52,7 +52,6 @@ The following optimizations have been applied to maximize token generation speed
 ### System Configuration
 1. CPU speed at 240 MHz
 2. PSRAM speed at 80 MHz
-3. FreeRTOS tick rate at 1000 Hz for responsive task switching
 
 
 ## Setup
